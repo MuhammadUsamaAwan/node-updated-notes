@@ -1,0 +1,261 @@
+```
+npm i cookie-parser argon2 jsonwebtoken
+npm i -D @types/jsonwebtoken @types/cookie-parser
+```
+
+```ts
+node;
+require('crypto').randomBytes(64).toString('hex');
+```
+
+```sh
+# .env
+ACCESS_TOKEN_SECRET=paste
+REFRESH_TOKEN_SECRET=paste
+```
+
+```ts
+// server.ts
+
+import cookieParser from 'cookie-parser';
+app.use(cookieParser());
+```
+
+```prisma
+// schema.prisma
+
+model User {
+  id           String  @id @default(uuid())
+  email        String  @unique
+  password     String?
+  refreshToken String?
+}
+```
+
+```ts
+// auth/authSchema.ts
+
+import { z } from 'zod';
+
+export const singupSchema = z.object({
+  body: z.object({
+    email: z.string().email(),
+    password: z.string().min(5).max(30),
+  }),
+});
+
+export type Signup = z.infer<typeof singupSchema>;
+
+export const loginSchema = z.object({
+  body: z.object({
+    email: z.string().email(),
+    password: z.string().min(5).max(30),
+  }),
+});
+
+export type Login = z.infer<typeof loginSchema>;
+```
+
+```ts
+// auth/authController.ts
+
+import { Request, Response } from 'express';
+import { PrismaClient } from '@prisma/client';
+import { PrismaClientKnownRequestError } from '@prisma/client/runtime';
+import * as argon from 'argon2';
+import jwt from 'jsonwebtoken';
+import { Login, Signup } from './authSchema';
+
+const prisma = new PrismaClient();
+
+export const signup = async (req: Signup, res: Response) => {
+  const { email, password } = req.body;
+  const hashedPassword = await argon.hash(password);
+  const refreshToken = getRefreshToken(email);
+  try {
+    await prisma.user.create({
+      data: {
+        email,
+        password: hashedPassword,
+        refreshToken,
+      },
+    });
+    res.cookie('jwt', refreshToken, {
+      httpOnly: true,
+      sameSite: 'none',
+      secure: true,
+      maxAge: 24 * 60 * 60 * 1000,
+    });
+    return res.status(201).json({ accessToken: getAccessToken(email) });
+  } catch (err) {
+    if (err instanceof PrismaClientKnownRequestError)
+      if (err.code === 'P2002') {
+        return res.status(409).json({ message: 'Email already in use' });
+      }
+  }
+};
+
+export const login = async (req: Login, res: Response) => {
+  const { email, password } = req.body;
+  const user = await prisma.user.findUnique({
+    where: {
+      email,
+    },
+  });
+  if (user && (await argon.verify(user.password as string, password))) {
+    const refreshToken = getRefreshToken(email);
+    await prisma.user.update({
+      where: {
+        email,
+      },
+      data: {
+        refreshToken,
+      },
+    });
+    res.cookie('jwt', refreshToken, {
+      httpOnly: true,
+      sameSite: 'none',
+      secure: true,
+      maxAge: 24 * 60 * 60 * 1000,
+    });
+    return res.status(200).json({ accessToken: getAccessToken(email) });
+  } else return res.status(400).json({ message: 'Invalid crendentials' });
+};
+
+export const sendRefreshToken = async (req: Request, res: Response) => {
+  const cookies = req.cookies;
+  if (!cookies?.jwt) return res.sendStatus(401);
+  const refreshToken = cookies.jwt;
+  const user = await prisma.user.findFirst({
+    where: {
+      refreshToken,
+    },
+  });
+  if (!user) return res.sendStatus(403);
+  return res.status(200).json({ accessToken: getAccessToken(user.email) });
+};
+
+export const logout = async (req: Request, res: Response) => {
+  const cookies = req.cookies;
+  if (!cookies?.jwt) return res.sendStatus(204);
+  const refreshToken = cookies.jwt;
+  const user = await prisma.user.findFirst({
+    where: {
+      refreshToken,
+    },
+  });
+  if (user) {
+    await prisma.user.update({
+      where: {
+        email: user.email,
+      },
+      data: {
+        refreshToken: '',
+      },
+    });
+  }
+  res.clearCookie('jwt', { httpOnly: true, sameSite: 'none', secure: true });
+  return res.sendStatus(204);
+};
+
+const getRefreshToken = (email: string) =>
+  jwt.sign({ email }, process.env.REFRESH_TOKEN_SECRET as string, {
+    expiresIn: '1d',
+  });
+
+const getAccessToken = (email: string) =>
+  jwt.sign({ email }, process.env.ACCESS_TOKEN_SECRET as string, {
+    expiresIn: '15min',
+  });
+```
+
+```ts
+// auth/authRoutes.ts
+
+import { Router } from 'express';
+import validateSchema from '../middleware/validateSchema';
+import { login, logout, sendRefreshToken, signup } from './authController';
+import { loginSchema, singupSchema } from './authSchema';
+
+const router = Router();
+export default router;
+
+router.post('/login', validateSchema(loginSchema), login);
+router.post('/signup', validateSchema(singupSchema), signup);
+router.post('/refresh', sendRefreshToken);
+router.post('/logout', logout);
+```
+
+```ts
+// router.ts
+import auth from './auth/authRoutes';
+
+router.use('/', auth);
+```
+
+```ts
+// types/express/index.d.ts
+
+import express from 'express';
+import { User } from '@prisma/client';
+
+declare global {
+  namespace Express {
+    interface Request {
+      user?: User | null;
+    }
+  }
+}
+```
+
+```json
+// tsconfig.json
+
+"typeRoots": ["./src/types"]
+```
+
+```ts
+// middleware/jwtGuard.ts
+
+import { Request, Response, NextFunction } from 'express';
+import { PrismaClient } from '@prisma/client';
+import jwt from 'jsonwebtoken';
+
+const prisma = new PrismaClient();
+
+const authGuard = async (req: Request, res: Response, next: NextFunction) => {
+  const authorization = req.headers.authorization;
+  if (authorization && authorization.startsWith('Bearer')) {
+    try {
+      const token = authorization.split(' ')[1];
+      const decoded = jwt.verify(token, process.env.ACCESS_TOKEN_SECRET as string) as any;
+      req.user = await prisma.user.findUnique({
+        where: {
+          email: decoded.email,
+        },
+      });
+      next();
+    } catch (err) {
+      return res.status(403).json({ message: 'Not authorized' });
+    }
+  } else return res.status(401).json({ message: 'Not authorized, no token' });
+};
+
+export default authGuard;
+```
+
+```ts
+// typesrequestUser.d.ts
+
+import { User } from '@prisma/client';
+
+interface RequestUser {
+  user?: User | null;
+}
+```
+
+```ts
+import { RequestUser } from '../types/requestUser';
+
+export type CreateTodo = z.infer<typeof createTodoSchema> & RequestUser;
+```

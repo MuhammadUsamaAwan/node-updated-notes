@@ -1,0 +1,133 @@
+```
+npm i yup
+```
+
+```ts
+// middleware/validateSchema.ts
+
+import { Request, Response, NextFunction } from 'express';
+import { AnyZodObject } from 'zod';
+
+const validateSchema = (schema: AnyZodObject) => async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    schema.parse({
+      body: req.body,
+      query: req.query,
+      params: req.params,
+    });
+    next();
+  } catch (err: any) {
+    return res
+      .status(400)
+      .json({ message: err.issues.map((issue: any) => `${issue.path.join('.')}: ${issue.message}`).join(', ') });
+  }
+};
+
+export default validateSchema;
+```
+
+```ts
+// todo/todoSchema.ts
+
+import { z } from 'zod';
+
+export const createTodoSchema = z.object({
+  body: z.object({
+    name: z.string().min(4).max(100),
+  }),
+});
+
+export type CreateTodo = z.infer<typeof createTodoSchema>;
+
+export const updateTodoSchema = z.object({
+  body: z.object({
+    name: z.string().min(4).max(100),
+  }),
+  params: z.object({
+    id: z.string().uuid(),
+  }),
+});
+
+export type UpdateTodo = z.infer<typeof updateTodoSchema>;
+
+export const deleteTodoSchema = z.object({
+  params: z.object({
+    id: z.string().uuid(),
+  }),
+});
+
+export type DeleteTodo = z.infer<typeof deleteTodoSchema>;
+```
+
+```ts
+// routes/todo/todoController.ts
+
+import { Request, Response } from 'express';
+import { PrismaClient } from '@prisma/client';
+import { CreateTodo, DeleteTodo, UpdateTodo } from './todoSchema';
+
+const prisma = new PrismaClient();
+
+export const getTodos = async (req: Request, res: Response) => {
+  const todos = await prisma.todo.findMany();
+  return res.status(200).json(todos);
+};
+
+export const getTodo = async (req: Request, res: Response) => {
+  const todos = await prisma.todo.findUnique({
+    where: {
+      id: req.params.id,
+    },
+  });
+  return res.status(200).json(todos);
+};
+
+export const createTodo = async (req: CreateTodo, res: Response) => {
+  const todo = await prisma.todo.create({
+    data: {
+      name: req.body.name,
+    },
+  });
+  return res.status(201).json(todo);
+};
+
+export const updateTodo = async (req: UpdateTodo, res: Response) => {
+  const todo = await prisma.todo.update({
+    where: {
+      id: req.params.id,
+    },
+    data: {
+      name: req.body.name,
+    },
+  });
+  return res.status(200).json(todo);
+};
+
+export const deleteTodo = async (req: DeleteTodo, res: Response) => {
+  await prisma.todo.delete({
+    where: {
+      id: req.params.id,
+    },
+  });
+  return res.sendStatus(204);
+};
+```
+
+```ts
+// routes/todo/todoRoutes.ts
+
+import { Router } from 'express';
+import validateSchema from '../middleware/validateSchema';
+import { createTodo, deleteTodo, getTodo, getTodos, updateTodo } from './todoController';
+import { createTodoSchema, deleteTodoSchema, updateTodoSchema } from './todoSchema';
+
+const router = Router();
+export default router;
+
+router.route('/').get(getTodos).post(validateSchema(createTodoSchema), createTodo);
+router
+  .route('/:id')
+  .get(getTodo)
+  .patch(validateSchema(updateTodoSchema), updateTodo)
+  .delete(validateSchema(deleteTodoSchema), deleteTodo);
+```
